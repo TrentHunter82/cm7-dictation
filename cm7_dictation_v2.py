@@ -882,6 +882,32 @@ class CM7Widget:
         self._state = "speaking"
         threading.Thread(target=self._tts_grab_and_speak, daemon=True).start()
 
+    @staticmethod
+    def _play_click():
+        """Play a short confirmation click sound."""
+        if not _HAS_PYAUDIO:
+            return
+        try:
+            import pyaudio as pa
+            rate = 44100
+            duration = 0.035
+            n = int(rate * duration)
+            samples = []
+            for i in range(n):
+                t = i / rate
+                env = max(0.0, 1.0 - i / n)  # Fast decay
+                val = env * math.sin(2 * math.pi * 1800 * t) * 0.4
+                samples.append(int(val * 32767))
+            data = struct.pack(f"{n}h", *samples)
+            p = pa.PyAudio()
+            s = p.open(format=pa.paInt16, channels=1, rate=rate, output=True)
+            s.write(data)
+            s.stop_stream()
+            s.close()
+            p.terminate()
+        except:
+            pass
+
     def _tts_grab_and_speak(self):
         try:
             # Speak whatever is on the clipboard.
@@ -892,6 +918,7 @@ class CM7Widget:
                 self._state = "ready"
                 return
             text = text.strip()
+            self._play_click()
             print(f"[CM7] Speaking: {text[:80]}...")
             self._tts.speak(text, on_done=lambda: setattr(self, '_state', 'ready'))
         except Exception as e:
