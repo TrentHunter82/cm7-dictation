@@ -35,6 +35,12 @@ try:
 except ImportError:
     _HAS_PASTE = False
 
+try:
+    import requests
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -114,6 +120,96 @@ def prompt_api_key():
     win.protocol("WM_DELETE_WINDOW", lambda: win.destroy())
     win.mainloop()
     return result[0]
+
+
+def load_elevenlabs_config():
+    path = _config_path()
+    if not os.path.exists(path):
+        return {"api_key": None, "voice_id": None}
+    cfg = configparser.ConfigParser()
+    cfg.read(path)
+    return {
+        "api_key": cfg.get("elevenlabs", "api_key", fallback=None),
+        "voice_id": cfg.get("elevenlabs", "voice_id", fallback=None),
+    }
+
+
+def save_elevenlabs_config(api_key, voice_id):
+    path = _config_path()
+    cfg = configparser.ConfigParser()
+    if os.path.exists(path):
+        cfg.read(path)
+    if not cfg.has_section("elevenlabs"):
+        cfg.add_section("elevenlabs")
+    cfg.set("elevenlabs", "api_key", api_key)
+    cfg.set("elevenlabs", "voice_id", voice_id)
+    with open(path, "w") as f:
+        cfg.write(f)
+
+
+def prompt_elevenlabs_config():
+    """Show a tkinter dialog to collect ElevenLabs API key and Voice ID."""
+    result = [None, None]
+
+    win = tk.Tk()
+    win.title("CM7 - ElevenLabs TTS Setup")
+    win.configure(bg="#1a1a1a")
+    win.resizable(False, False)
+    win.geometry("420x260")
+    win.attributes("-topmost", True)
+
+    win.update_idletasks()
+    x = (win.winfo_screenwidth() - 420) // 2
+    y = (win.winfo_screenheight() - 260) // 2
+    win.geometry(f"+{x}+{y}")
+
+    tk.Label(
+        win, text="ElevenLabs TTS Setup", font=("Arial", 13, "bold"),
+        fg="#e0e0e0", bg="#1a1a1a"
+    ).pack(pady=(18, 4))
+
+    tk.Label(
+        win, text="Get your API key at elevenlabs.io/app/settings/api-keys",
+        font=("Arial", 9), fg="#808080", bg="#1a1a1a"
+    ).pack()
+
+    tk.Label(
+        win, text="API Key", font=("Arial", 10),
+        fg="#c0c0c0", bg="#1a1a1a"
+    ).pack(pady=(12, 2), anchor="w", padx=40)
+    key_entry = tk.Entry(win, width=44, font=("Consolas", 10), show="*")
+    key_entry.pack()
+    key_entry.focus_set()
+
+    tk.Label(
+        win, text="Voice ID", font=("Arial", 10),
+        fg="#c0c0c0", bg="#1a1a1a"
+    ).pack(pady=(10, 2), anchor="w", padx=40)
+    voice_entry = tk.Entry(win, width=44, font=("Consolas", 10))
+    voice_entry.pack()
+
+    def submit(event=None):
+        k = key_entry.get().strip()
+        v = voice_entry.get().strip()
+        if k and v:
+            result[0] = k
+            result[1] = v
+            win.destroy()
+
+    key_entry.bind("<Return>", lambda e: voice_entry.focus_set())
+    voice_entry.bind("<Return>", submit)
+
+    btn = tk.Button(
+        win, text="Save & Launch", command=submit,
+        font=("Arial", 10, "bold"), bg="#333", fg="#e0e0e0",
+        activebackground="#555", activeforeground="#fff",
+        relief="flat", padx=16, pady=4
+    )
+    btn.pack(pady=(12, 0))
+
+    win.protocol("WM_DELETE_WINDOW", lambda: win.destroy())
+    win.mainloop()
+    return (result[0], result[1])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -223,6 +319,92 @@ class Recorder:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TTS PLAYER
+# ═══════════════════════════════════════════════════════════════════════════════
+class TTSPlayer:
+    RATE = 16000
+    CHUNK = 1024
+
+    def __init__(self, api_key, voice_id, model_id="eleven_multilingual_v2"):
+        self._api_key = api_key
+        self._voice_id = voice_id
+        self._model_id = model_id
+        self._playing = False
+        self._stream = None
+
+    @property
+    def is_playing(self):
+        return self._playing
+
+    def speak(self, text, on_done=None):
+        if not _HAS_REQUESTS:
+            print("[CM7] 'requests' package required for TTS. pip install requests")
+            if on_done:
+                on_done()
+            return
+        if not _HAS_PYAUDIO:
+            print("[CM7] 'pyaudio' package required for TTS playback.")
+            if on_done:
+                on_done()
+            return
+
+        import pyaudio as pa
+        self._playing = True
+        p = None
+        try:
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{self._voice_id}"
+            headers = {
+                "xi-api-key": self._api_key,
+                "Content-Type": "application/json",
+            }
+            body = {"text": text, "model_id": self._model_id}
+            resp = requests.post(
+                url, json=body, headers=headers,
+                params={"output_format": "pcm_16000"},
+                stream=True, timeout=15,
+            )
+            if resp.status_code != 200:
+                print(f"[CM7] TTS API error: {resp.status_code} - {resp.text[:200]}")
+                return
+
+            p = pa.PyAudio()
+            self._stream = p.open(
+                format=pa.paInt16, channels=1, rate=self.RATE,
+                output=True, frames_per_buffer=self.CHUNK,
+            )
+            for chunk in resp.iter_content(chunk_size=self.CHUNK * 2):
+                if not self._playing:
+                    break
+                if chunk:
+                    self._stream.write(chunk)
+        except Exception as e:
+            print(f"[CM7] TTS error: {e}")
+        finally:
+            self._playing = False
+            if self._stream:
+                try:
+                    self._stream.stop_stream()
+                    self._stream.close()
+                except:
+                    pass
+                self._stream = None
+            if p:
+                p.terminate()
+            if on_done:
+                on_done()
+
+    def stop(self):
+        self._playing = False
+        if self._stream:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except:
+                pass
+            self._stream = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CM7 WIDGET - HAL EDITION
 # ═══════════════════════════════════════════════════════════════════════════════
 class CM7Widget:
@@ -236,12 +418,16 @@ class CM7Widget:
         backend="groq",
         api_key=None,
         always_on_top=True,
+        elevenlabs_api_key=None,
+        elevenlabs_voice_id=None,
+        tts_hotkey="f9",
     ):
         self.parent = parent
         self.on_transcription = on_transcription
         self.hotkey = hotkey
         self.auto_paste = auto_paste
         self.always_on_top = always_on_top
+        self._tts_hotkey = tts_hotkey
 
         if transcribe_fn:
             self._transcribe = transcribe_fn
@@ -253,6 +439,11 @@ class CM7Widget:
             self._transcribe = mock_backend()
         else:
             self._transcribe = groq_backend(api_key)
+
+        if elevenlabs_api_key and elevenlabs_voice_id:
+            self._tts = TTSPlayer(elevenlabs_api_key, elevenlabs_voice_id)
+        else:
+            self._tts = None
 
         self._rec = Recorder()
         self._state = "ready"
@@ -507,13 +698,20 @@ class CM7Widget:
                 fill=f"#{min(255,alpha):02x}{g_val:02x}{b_val:02x}", outline=""
             )
 
-        # ═══ F8 LABEL ═══
+        # ═══ HOTKEY LABELS ═══
         c.create_text(
             12, 14,
             text="F8",
             fill="#505050",
             font=("Arial", 9, "bold"),
             anchor="nw"
+        )
+        c.create_text(
+            SIZE - 12, 14,
+            text="F9",
+            fill="#505050",
+            font=("Arial", 9, "bold"),
+            anchor="ne"
         )
 
         # ═══ CLICK BINDING ═══
@@ -534,6 +732,9 @@ class CM7Widget:
         elif st == "processing":
             pulse = (math.sin(t * 4) + 1) / 2
             target = 0.5 + pulse * 0.4
+        elif st == "speaking":
+            pulse = (math.sin(t * 3) + 1) / 2
+            target = 0.4 + pulse * 0.3
         else:
             # Subtle breathing
             target = 0.15 + (math.sin(t * 1.5) + 1) / 2 * 0.1
@@ -563,6 +764,13 @@ class CM7Widget:
                 r = min(255, intensity)
                 g = min(255, int(intensity * 0.48))
                 b = min(255, int(intensity * 0.08))
+            elif st == "speaking":
+                # Blue/cyan glow
+                pulse = (math.sin(t * 4 + i * 0.06) + 1) / 2
+                intensity = int((70 + 50 * pulse) * falloff)
+                r = min(255, int(intensity * 0.15))
+                g = min(255, int(intensity * 0.55))
+                b = min(255, intensity)
             else:
                 # Subtle warm breathing glow
                 breath = (math.sin(t * 1.5) + 1) / 2
@@ -582,6 +790,10 @@ class CM7Widget:
             pulse = (math.sin(t * 6) + 1) / 2
             c.itemconfig(self._eye_core, fill=f"#ff{int(180+40*pulse):02x}{int(140+30*pulse):02x}")
             c.itemconfig(self._eye_highlight, fill="#ff9060")
+        elif st == "speaking":
+            pulse = (math.sin(t * 5) + 1) / 2
+            c.itemconfig(self._eye_core, fill=f"#{int(140+30*pulse):02x}{int(180+40*pulse):02x}ff")
+            c.itemconfig(self._eye_highlight, fill="#6090ff")
         else:
             c.itemconfig(self._eye_core, fill="#ffe0c0")
             c.itemconfig(self._eye_highlight, fill="#ff9060")
@@ -629,6 +841,35 @@ class CM7Widget:
         except Exception as e:
             print(f"[CM7] Paste error: {e}")
 
+    def _tts_toggle(self):
+        if not self._tts:
+            print("[CM7] TTS not configured. Run with --tts-setup")
+            return
+        if self._state == "speaking":
+            self._tts.stop()
+            self._state = "ready"
+            return
+        if self._state != "ready":
+            return
+        if not _HAS_PASTE:
+            print("[CM7] pyperclip/pyautogui required for TTS")
+            return
+        # Grab selected text via clipboard
+        old_clip = pyperclip.paste()
+        pyautogui.hotkey("ctrl", "c")
+        time.sleep(0.15)
+        text = pyperclip.paste()
+        pyperclip.copy(old_clip)
+        if not text or text == old_clip:
+            print("[CM7] No text selected")
+            return
+        print(f"[CM7] Speaking: {text[:80]}...")
+        self._state = "speaking"
+        threading.Thread(target=self._tts_run, args=(text,), daemon=True).start()
+
+    def _tts_run(self, text):
+        self._tts.speak(text, on_done=lambda: setattr(self, '_state', 'ready'))
+
     def _register_hotkey(self):
         if not _HAS_KEYBOARD:
             return
@@ -651,6 +892,19 @@ class CM7Widget:
         except Exception as e:
             print(f"[CM7] Hotkey failed: {e}")
 
+        # TTS hotkey (single-press toggle)
+        if self._tts:
+            try:
+                tts_key = self._tts_hotkey.lower().split("+")[-1]
+
+                def on_tts_press(e):
+                    if self._root:
+                        self._root.after(0, self._tts_toggle)
+
+                keyboard.on_press_key(tts_key, on_tts_press)
+            except Exception as e:
+                print(f"[CM7] TTS hotkey failed: {e}")
+
     def _drag_start(self, e):
         self._dx = e.x_root - self._root.winfo_x()
         self._dy = e.y_root - self._root.winfo_y()
@@ -662,6 +916,8 @@ class CM7Widget:
             pass
 
     def _quit(self):
+        if self._tts and self._tts.is_playing:
+            self._tts.stop()
         if _HAS_KEYBOARD:
             try:
                 keyboard.unhook_all()
@@ -681,7 +937,9 @@ if __name__ == "__main__":
     p.add_argument("--hotkey", default="f8")
     p.add_argument("--no-paste", action="store_true")
     p.add_argument("--api-key", default=None, help="Groq API key (overrides config)")
-    p.add_argument("--setup", action="store_true", help="Re-enter API key")
+    p.add_argument("--setup", action="store_true", help="Re-enter Groq API key")
+    p.add_argument("--tts-setup", action="store_true", help="Configure ElevenLabs TTS")
+    p.add_argument("--tts-hotkey", default="f9", help="Hotkey for TTS (default: f9)")
     args = p.parse_args()
 
     api_key = None
@@ -709,10 +967,30 @@ if __name__ == "__main__":
                     print("[CM7] No key entered, exiting.")
                     exit(1)
 
+    # ElevenLabs TTS config
+    el_config = {"api_key": None, "voice_id": None}
+    if args.tts_setup:
+        result = prompt_elevenlabs_config()
+        if result[0] and result[1]:
+            save_elevenlabs_config(result[0], result[1])
+            el_config = {"api_key": result[0], "voice_id": result[1]}
+            print("[CM7] ElevenLabs config saved.")
+        else:
+            print("[CM7] ElevenLabs setup cancelled.")
+    else:
+        el_config = load_elevenlabs_config()
+        if not el_config["api_key"]:
+            el_config["api_key"] = os.environ.get("ELEVENLABS_API_KEY")
+        if not el_config["voice_id"]:
+            el_config["voice_id"] = os.environ.get("ELEVENLABS_VOICE_ID")
+
     CM7Widget(
         hotkey=args.hotkey,
         backend=args.backend,
         api_key=api_key,
         auto_paste=not args.no_paste,
         on_transcription=(lambda t: None) if args.no_paste else None,
+        elevenlabs_api_key=el_config.get("api_key"),
+        elevenlabs_voice_id=el_config.get("voice_id"),
+        tts_hotkey=args.tts_hotkey,
     ).run()
