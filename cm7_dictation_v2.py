@@ -155,12 +155,12 @@ def prompt_elevenlabs_config():
     win.title("CM7 - ElevenLabs TTS Setup")
     win.configure(bg="#1a1a1a")
     win.resizable(False, False)
-    win.geometry("420x260")
+    win.geometry("420x290")
     win.attributes("-topmost", True)
 
     win.update_idletasks()
     x = (win.winfo_screenwidth() - 420) // 2
-    y = (win.winfo_screenheight() - 260) // 2
+    y = (win.winfo_screenheight() - 290) // 2
     win.geometry(f"+{x}+{y}")
 
     tk.Label(
@@ -188,13 +188,29 @@ def prompt_elevenlabs_config():
     voice_entry = tk.Entry(win, width=44, font=("Consolas", 10))
     voice_entry.pack()
 
+    status_label = tk.Label(
+        win, text="", font=("Arial", 9),
+        fg="#ff6060", bg="#1a1a1a"
+    )
+    status_label.pack(pady=(4, 0))
+
     def submit(event=None):
         k = key_entry.get().strip()
         v = voice_entry.get().strip()
-        if k and v:
-            result[0] = k
-            result[1] = v
-            win.destroy()
+        if not k and not v:
+            status_label.config(text="Both fields are required")
+            return
+        if not k:
+            status_label.config(text="API Key is required")
+            key_entry.focus_set()
+            return
+        if not v:
+            status_label.config(text="Voice ID is required")
+            voice_entry.focus_set()
+            return
+        result[0] = k
+        result[1] = v
+        win.destroy()
 
     key_entry.bind("<Return>", lambda e: voice_entry.focus_set())
     voice_entry.bind("<Return>", submit)
@@ -205,7 +221,7 @@ def prompt_elevenlabs_config():
         activebackground="#555", activeforeground="#fff",
         relief="flat", padx=16, pady=4
     )
-    btn.pack(pady=(12, 0))
+    btn.pack(pady=(6, 0))
 
     win.protocol("WM_DELETE_WINDOW", lambda: win.destroy())
     win.mainloop()
@@ -360,23 +376,32 @@ class TTSPlayer:
             body = {"text": text, "model_id": self._model_id}
             resp = requests.post(
                 url, json=body, headers=headers,
-                params={"output_format": "pcm_16000"},
-                stream=True, timeout=15,
+                params={"output_format": "pcm_24000"},
+                timeout=30,
             )
             if resp.status_code != 200:
                 print(f"[CM7] TTS API error: {resp.status_code} - {resp.text[:200]}")
                 return
 
+            audio_data = resp.content
+            # Ensure even length for 16-bit PCM
+            if len(audio_data) % 2 != 0:
+                audio_data = audio_data[:-1]
+            if not audio_data:
+                return
+
             p = pa.PyAudio()
             self._stream = p.open(
-                format=pa.paInt16, channels=1, rate=self.RATE,
-                output=True, frames_per_buffer=self.CHUNK,
+                format=pa.paInt16, channels=1, rate=24000,
+                output=True, frames_per_buffer=2048,
             )
-            for chunk in resp.iter_content(chunk_size=self.CHUNK * 2):
-                if not self._playing:
-                    break
-                if chunk:
-                    self._stream.write(chunk)
+            # Play in chunks so we can still be stopped
+            pos = 0
+            chunk_size = 4096
+            while pos < len(audio_data) and self._playing:
+                end = min(pos + chunk_size, len(audio_data))
+                self._stream.write(audio_data[pos:end])
+                pos = end
         except Exception as e:
             print(f"[CM7] TTS error: {e}")
         finally:
@@ -854,21 +879,24 @@ class CM7Widget:
         if not _HAS_PASTE:
             print("[CM7] pyperclip/pyautogui required for TTS")
             return
-        # Grab selected text via clipboard
-        old_clip = pyperclip.paste()
-        pyautogui.hotkey("ctrl", "c")
-        time.sleep(0.15)
-        text = pyperclip.paste()
-        pyperclip.copy(old_clip)
-        if not text or text == old_clip:
-            print("[CM7] No text selected")
-            return
-        print(f"[CM7] Speaking: {text[:80]}...")
         self._state = "speaking"
-        threading.Thread(target=self._tts_run, args=(text,), daemon=True).start()
+        threading.Thread(target=self._tts_grab_and_speak, daemon=True).start()
 
-    def _tts_run(self, text):
-        self._tts.speak(text, on_done=lambda: setattr(self, '_state', 'ready'))
+    def _tts_grab_and_speak(self):
+        try:
+            # Speak whatever is on the clipboard.
+            # User workflow: select text, Ctrl+C, then F9.
+            text = pyperclip.paste()
+            if not text or not text.strip():
+                print("[CM7] Clipboard empty. Copy text first (Ctrl+C), then F9.")
+                self._state = "ready"
+                return
+            text = text.strip()
+            print(f"[CM7] Speaking: {text[:80]}...")
+            self._tts.speak(text, on_done=lambda: setattr(self, '_state', 'ready'))
+        except Exception as e:
+            print(f"[CM7] TTS error: {e}")
+            self._state = "ready"
 
     def _register_hotkey(self):
         if not _HAS_KEYBOARD:
