@@ -8,6 +8,7 @@ import tkinter as tk
 import threading
 import time
 import os
+import platform
 import tempfile
 import wave
 import struct
@@ -16,6 +17,8 @@ import argparse
 import configparser
 from typing import Callable, Optional
 
+_IS_MAC = platform.system() == "Darwin"
+
 try:
     import pyaudio
     _HAS_PYAUDIO = True
@@ -23,10 +26,10 @@ except ImportError:
     _HAS_PYAUDIO = False
 
 try:
-    import keyboard
-    _HAS_KEYBOARD = True
+    from pynput import keyboard as pynput_kb
+    _HAS_PYNPUT = True
 except ImportError:
-    _HAS_KEYBOARD = False
+    _HAS_PYNPUT = False
 
 try:
     import pyperclip
@@ -40,6 +43,18 @@ try:
     _HAS_REQUESTS = True
 except ImportError:
     _HAS_REQUESTS = False
+
+# Map hotkey name strings to pynput Key objects
+_PYNPUT_KEY_MAP = {}
+if _HAS_PYNPUT:
+    for i in range(1, 21):
+        _PYNPUT_KEY_MAP[f"f{i}"] = getattr(pynput_kb.Key, f"f{i}", None)
+    _PYNPUT_KEY_MAP.update({
+        "ctrl": pynput_kb.Key.ctrl_l, "shift": pynput_kb.Key.shift_l,
+        "alt": pynput_kb.Key.alt_l, "cmd": pynput_kb.Key.cmd,
+        "space": pynput_kb.Key.space, "tab": pynput_kb.Key.tab,
+        "esc": pynput_kb.Key.esc,
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -483,6 +498,8 @@ class CM7Widget:
         self._eye_core = None
         self._eye_highlight = None
         self._reflections = []
+        self._status_text = None
+        self._state_ring = None
 
     def run(self):
         root = tk.Tk()
@@ -494,7 +511,8 @@ class CM7Widget:
         root.overrideredirect(True)
         if self.always_on_top:
             root.attributes("-topmost", True)
-        root.attributes("-transparentcolor", "#1a1a1a")
+        if not _IS_MAC:
+            root.attributes("-transparentcolor", "#1a1a1a")
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
         root.geometry(f"+{sw - SIZE - 40}+{40}")
@@ -739,6 +757,22 @@ class CM7Widget:
             anchor="ne"
         )
 
+        # ═══ STATE INDICATOR RING ═══
+        self._state_ring = c.create_oval(
+            CX - OUTER_R - 4, CY - OUTER_R - 4,
+            CX + OUTER_R + 4, CY + OUTER_R + 4,
+            outline="#1a1a1a", width=3
+        )
+
+        # ═══ STATUS TEXT ═══
+        self._status_text = c.create_text(
+            CX, SIZE - 10,
+            text="",
+            fill="#1a1a1a",
+            font=("Arial", 10, "bold"),
+            anchor="center"
+        )
+
         # ═══ CLICK BINDING ═══
         c.tag_bind("all", "<ButtonPress-1>", lambda e: self._press())
         c.tag_bind("all", "<ButtonRelease-1>", lambda e: self._release())
@@ -775,17 +809,17 @@ class CM7Widget:
             # Quadratic falloff for ultra-smooth realistic glow
             falloff = (1 - dist ** 0.7) ** 2
             if st == "recording":
-                # Intense red-orange glow with ripple
+                # Intense red-orange glow with ripple — boosted for visibility
                 pulse = (math.sin(t * 8 + i * 0.08) + 1) / 2
                 ripple = (math.sin(t * 12 - i * 0.15) + 1) / 2 * 0.15
-                intensity = int((120 + 100 * level + 40 * pulse + 20 * ripple) * falloff)
+                intensity = int((180 + 130 * level + 50 * pulse + 25 * ripple) * falloff)
                 r = min(255, intensity)
-                g = min(255, int(intensity * 0.38))
-                b = min(255, int(intensity * 0.08))
+                g = min(255, int(intensity * 0.35))
+                b = min(255, int(intensity * 0.06))
             elif st == "processing":
-                # Pulsing orange with wave
+                # Pulsing orange with wave — boosted
                 pulse = (math.sin(t * 5 + i * 0.06) + 1) / 2
-                intensity = int((80 + 60 * pulse) * falloff)
+                intensity = int((120 + 80 * pulse) * falloff)
                 r = min(255, intensity)
                 g = min(255, int(intensity * 0.48))
                 b = min(255, int(intensity * 0.08))
@@ -823,6 +857,31 @@ class CM7Widget:
             c.itemconfig(self._eye_core, fill="#ffe0c0")
             c.itemconfig(self._eye_highlight, fill="#ff9060")
 
+        # ═══ UPDATE STATUS TEXT & RING ═══
+        if self._status_text and self._state_ring:
+            if st == "recording":
+                pulse_alpha = int(200 + 55 * ((math.sin(t * 6) + 1) / 2))
+                c.itemconfig(self._status_text, text="REC",
+                             fill=f"#{min(255, pulse_alpha):02x}2020")
+                ring_bright = int(180 + 75 * ((math.sin(t * 8) + 1) / 2))
+                c.itemconfig(self._state_ring,
+                             outline=f"#{min(255, ring_bright):02x}1515", width=3)
+            elif st == "processing":
+                c.itemconfig(self._status_text, text="\u2022\u2022\u2022",
+                             fill="#e08030")
+                ring_bright = int(140 + 60 * ((math.sin(t * 5) + 1) / 2))
+                c.itemconfig(self._state_ring,
+                             outline=f"#{min(255, ring_bright):02x}{int(ring_bright*0.5):02x}10", width=3)
+            elif st == "speaking":
+                c.itemconfig(self._status_text, text="TTS",
+                             fill="#4080ff")
+                ring_bright = int(100 + 60 * ((math.sin(t * 4) + 1) / 2))
+                c.itemconfig(self._state_ring,
+                             outline=f"#15{int(ring_bright*0.6):02x}{min(255, ring_bright):02x}", width=3)
+            else:
+                c.itemconfig(self._status_text, text="", fill="#1a1a1a")
+                c.itemconfig(self._state_ring, outline="#1a1a1a", width=3)
+
         if self._root:
             self._root.after(25, self._tick)
 
@@ -857,12 +916,14 @@ class CM7Widget:
     def _paste(self, text):
         try:
             time.sleep(0.15)
-            if _HAS_KEYBOARD:
-                keyboard.write(text)
+            if _HAS_PYNPUT:
+                ctrl = pynput_kb.Controller()
+                ctrl.type(text)
             else:
                 pyperclip.copy(text)
                 time.sleep(0.08)
-                pyautogui.hotkey("ctrl", "v")
+                mod = "command" if _IS_MAC else "ctrl"
+                pyautogui.hotkey(mod, "v")
         except Exception as e:
             print(f"[CM7] Paste error: {e}")
 
@@ -926,39 +987,40 @@ class CM7Widget:
             self._state = "ready"
 
     def _register_hotkey(self):
-        if not _HAS_KEYBOARD:
+        if not _HAS_PYNPUT:
             return
-        try:
-            keys = self.hotkey.lower().split("+")
-            main = keys[-1]
-            mods = keys[:-1]
 
-            def on_press(e):
-                if all(keyboard.is_pressed(m) for m in mods):
+        # Resolve hotkey names to pynput Key objects
+        keys = self.hotkey.lower().split("+")
+        main_key = _PYNPUT_KEY_MAP.get(keys[-1])
+        mod_keys = [_PYNPUT_KEY_MAP.get(m) for m in keys[:-1]]
+        mod_keys = [m for m in mod_keys if m is not None]
+
+        tts_key = None
+        if self._tts:
+            tts_key = _PYNPUT_KEY_MAP.get(self._tts_hotkey.lower().split("+")[-1])
+
+        pressed_keys = set()
+
+        def on_press(key):
+            pressed_keys.add(key)
+            if key == main_key:
+                if all(m in pressed_keys for m in mod_keys):
                     if self._root:
                         self._root.after(0, self._press)
+            if tts_key and key == tts_key:
+                if self._root:
+                    self._root.after(0, self._tts_toggle)
 
-            def on_release(e):
+        def on_release(key):
+            pressed_keys.discard(key)
+            if key == main_key:
                 if self._root:
                     self._root.after(0, self._release)
 
-            keyboard.on_press_key(main, on_press)
-            keyboard.on_release_key(main, on_release)
-        except Exception as e:
-            print(f"[CM7] Hotkey failed: {e}")
-
-        # TTS hotkey (single-press toggle)
-        if self._tts:
-            try:
-                tts_key = self._tts_hotkey.lower().split("+")[-1]
-
-                def on_tts_press(e):
-                    if self._root:
-                        self._root.after(0, self._tts_toggle)
-
-                keyboard.on_press_key(tts_key, on_tts_press)
-            except Exception as e:
-                print(f"[CM7] TTS hotkey failed: {e}")
+        self._listener = pynput_kb.Listener(on_press=on_press, on_release=on_release)
+        self._listener.daemon = True
+        self._listener.start()
 
     def _drag_start(self, e):
         self._dx = e.x_root - self._root.winfo_x()
@@ -973,9 +1035,9 @@ class CM7Widget:
     def _quit(self):
         if self._tts and self._tts.is_playing:
             self._tts.stop()
-        if _HAS_KEYBOARD:
+        if hasattr(self, '_listener'):
             try:
-                keyboard.unhook_all()
+                self._listener.stop()
             except:
                 pass
         try:

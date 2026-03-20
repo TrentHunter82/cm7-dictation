@@ -1,6 +1,6 @@
 groq
 pyaudio
-keyboard
+pynput
 pyperclip
 pyautogui
 requests
