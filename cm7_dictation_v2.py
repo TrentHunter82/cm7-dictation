@@ -44,6 +44,12 @@ try:
 except ImportError:
     _HAS_REQUESTS = False
 
+try:
+    from PIL import Image, ImageTk
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
 # Map hotkey name strings to pynput Key objects
 _PYNPUT_KEY_MAP = {}
 if _HAS_PYNPUT:
@@ -246,10 +252,10 @@ def prompt_elevenlabs_config():
 # ═══════════════════════════════════════════════════════════════════════════════
 # DIMENSIONS
 # ═══════════════════════════════════════════════════════════════════════════════
-SIZE = 160
+SIZE = 220
 CX, CY = SIZE // 2, SIZE // 2
 OUTER_R = 68
-INNER_R = 52  # Silver ring (16px)
+INNER_R = 52
 EYE_R = 18
 
 
@@ -519,6 +525,8 @@ class CM7Widget:
         root.bind("<Button-1>", self._drag_start)
         root.bind("<B1-Motion>", self._drag_move)
         root.bind("<Button-3>", lambda e: self._quit())
+        self._widget_size = SIZE
+        self._resize_edge = None
 
         canvas = tk.Canvas(root, width=SIZE, height=SIZE,
                            bg="#1a1a1a", highlightthickness=0)
@@ -541,237 +549,71 @@ class CM7Widget:
         self.parent.after(25, self._tick)
         return c
 
+    def _generate_glow_frames(self, base_img):
+        """Pre-generate glow frames by boosting red/warm pixels at various intensities."""
+        import numpy as np
+        frames = []
+        arr = np.array(base_img, dtype=np.float32)
+        r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+        a = arr[:, :, 3] if arr.shape[2] == 4 else np.full_like(r, 255.0)
+
+        # Mask: pixels where red is dominant (the eye glow area)
+        red_mask = np.clip((r - np.maximum(g, b)) / 80.0, 0, 1)
+        # Also include darker warm areas (the lens reflections)
+        warm_mask = np.clip((r * 0.5 + g * 0.3) / 120.0, 0, 1)
+        glow_mask = np.maximum(red_mask, warm_mask * 0.4)
+
+        for i in range(16):
+            boost = i / 15.0  # 0.0 to 1.0
+            nr = np.clip(r + glow_mask * boost * 120, 0, 255)
+            ng = np.clip(g + glow_mask * boost * 30, 0, 255)
+            nb = np.clip(b + glow_mask * boost * 10, 0, 255)
+            frame = np.stack([nr, ng, nb, a], axis=-1).astype(np.uint8)
+            pil_frame = Image.fromarray(frame, "RGBA")
+            frames.append(ImageTk.PhotoImage(pil_frame))
+        return frames
+
+    def _generate_blue_frames(self, base_img):
+        """Pre-generate blue glow frames for speaking state."""
+        import numpy as np
+        frames = []
+        arr = np.array(base_img, dtype=np.float32)
+        r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+        a = arr[:, :, 3] if arr.shape[2] == 4 else np.full_like(r, 255.0)
+
+        red_mask = np.clip((r - np.maximum(g, b)) / 80.0, 0, 1)
+        warm_mask = np.clip((r * 0.5 + g * 0.3) / 120.0, 0, 1)
+        glow_mask = np.maximum(red_mask, warm_mask * 0.4)
+
+        for i in range(16):
+            boost = i / 15.0
+            nr = np.clip(r + glow_mask * boost * 20, 0, 255)
+            ng = np.clip(g + glow_mask * boost * 50, 0, 255)
+            nb = np.clip(b + glow_mask * boost * 140, 0, 255)
+            frame = np.stack([nr, ng, nb, a], axis=-1).astype(np.uint8)
+            pil_frame = Image.fromarray(frame, "RGBA")
+            frames.append(ImageTk.PhotoImage(pil_frame))
+        return frames
+
     def _draw(self):
         c = self._canvas
 
-        # ═══ OUTER SHADOW - 32 layers ═══
-        for s in range(32, 0, -1):
-            t = s / 32
-            alpha = int(5 + t * 20)
-            offset = s * 0.25
-            c.create_oval(
-                CX - OUTER_R + offset, CY - OUTER_R + offset + 3,
-                CX + OUTER_R + offset, CY + OUTER_R + offset + 3,
-                fill=f"#{alpha:02x}{alpha:02x}{alpha:02x}", outline=""
-            )
-
-        # ═══ OUTER METALLIC RING - 256 layers ═══
-        ring_thickness = OUTER_R - INNER_R
-        for i in range(256):
-            t = i / 256
-            # Very bright silver - near white at edges
-            base = 180 + 50 * t
-            specular = 60 * math.exp(-((t - 0.3) ** 2) * 12)
-            fresnel = 50 * (1 - t) ** 1.5  # Strong bright outer edge
-            brightness = int(min(255, base + specular + fresnel))
-
-            # Cool silver tint
-            r = min(255, brightness)
-            g = min(255, brightness + 3)
-            b = min(255, brightness + 8)
-
-            inset = t * ring_thickness
-            c.create_oval(
-                CX - OUTER_R + inset, CY - OUTER_R + inset,
-                CX + OUTER_R - inset, CY + OUTER_R - inset,
-                fill=f"#{r:02x}{g:02x}{b:02x}", outline=""
-            )
-
-        # Ring specular highlight (top) - 16 layers
-        for w in range(16, 0, -1):
-            t = w / 16
-            alpha = int(80 + 120 * t * t)
-            c.create_arc(
-                CX - OUTER_R + 3 + w * 0.5, CY - OUTER_R + 3 + w * 0.5,
-                CX + OUTER_R - 3 - w * 0.5, CY + OUTER_R - 3 - w * 0.5,
-                start=20, extent=140, style="arc",
-                outline=f"#{min(255,alpha):02x}{min(255,alpha):02x}{min(255,alpha):02x}", width=1
-            )
-
-        # Ring shadow (bottom) - 16 layers
-        for w in range(16, 0, -1):
-            t = w / 16
-            alpha = int(10 + 30 * t)
-            c.create_arc(
-                CX - OUTER_R + 3 + w * 0.5, CY - OUTER_R + 3 + w * 0.5,
-                CX + OUTER_R - 3 - w * 0.5, CY + OUTER_R - 3 - w * 0.5,
-                start=200, extent=140, style="arc",
-                outline=f"#{alpha:02x}{alpha:02x}{alpha:02x}", width=1
-            )
-
-        # ═══ DARK LENS - 256 layers ═══
-        lens_depth = INNER_R - 8
-        for i in range(256):
-            t = i / 256
-            # Deep glass with subtle red/brown tint
-            # Vignette effect - darker at edges
-            vignette = 1 - (1 - t) ** 0.5
-            base_r = int(28 * (1 - vignette * 0.7))
-            base_g = int(20 * (1 - vignette * 0.8))
-            base_b = int(18 * (1 - vignette * 0.85))
-
-            inset = t * lens_depth
-            c.create_oval(
-                CX - INNER_R + inset, CY - INNER_R + inset,
-                CX + INNER_R - inset, CY + INNER_R - inset,
-                fill=f"#{max(4,base_r):02x}{max(2,base_g):02x}{max(2,base_b):02x}", outline=""
-            )
-
-        # ═══ LENS REFLECTIONS - soft multipass ═══
-        # Primary curved reflection - 24 layers
-        for w in range(24, 0, -1):
-            t = w / 24
-            alpha = int(18 + 28 * t)
-            spread = w * 0.4
-            self._reflections.append(c.create_arc(
-                CX - INNER_R + 5 + spread, CY - INNER_R + 3 + spread * 0.5,
-                CX + INNER_R - 5 - spread, CY + 14 - spread * 0.3,
-                start=10, extent=160, style="arc",
-                outline=f"#{alpha:02x}{int(alpha*0.88):02x}{int(alpha*0.82):02x}", width=1
-            ))
-
-        # Secondary reflection - 16 layers
-        for w in range(16, 0, -1):
-            t = w / 16
-            alpha = int(15 + 20 * t)
-            spread = w * 0.3
-            self._reflections.append(c.create_arc(
-                CX - INNER_R + 8 + spread, CY - INNER_R + 6 + spread * 0.5,
-                CX + INNER_R - 8 - spread, CY + 10 - spread * 0.2,
-                start=20, extent=140, style="arc",
-                outline=f"#{alpha:02x}{int(alpha*0.9):02x}{int(alpha*0.86):02x}", width=1
-            ))
-
-        # Bottom right reflection - 20 layers
-        for i in range(20):
-            t = i / 20
-            alpha = int(12 + 18 * t)
-            self._reflections.append(c.create_arc(
-                CX - 2 - i * 0.3, CY + 6 - i * 0.2,
-                CX + INNER_R - 8 + i * 0.4, CY + INNER_R - 8 + i * 0.4,
-                start=270, extent=60, style="chord",
-                fill=f"#{alpha:02x}{int(alpha*0.92):02x}{int(alpha*0.88):02x}", outline=""
-            ))
-
-        # ═══ EYE GLOW - 32 rings (stay within lens) ═══
-        self._glow_rings = []
-        max_glow = INNER_R - EYE_R - 4  # Stay within lens, don't cover ring
-        for i in range(32, 0, -1):
-            extent = int(i * max_glow / 32)
-            ring = c.create_oval(
-                CX - EYE_R - extent, CY - EYE_R - extent,
-                CX + EYE_R + extent, CY + EYE_R + extent,
-                fill="#180600", outline=""
-            )
-            self._glow_rings.append(ring)
-
-        # ═══ EYE CENTER - 256 layers ═══
-        self._eye_layers = []
-        for i in range(256):
-            t = i / 256
-
-            # Ultra-smooth gradient with proper color science
-            # Using smooth hermite interpolation between color stops
-            if t < 0.25:
-                # Deep crimson to red
-                tt = t / 0.25
-                tt = tt * tt * (3 - 2 * tt)  # Smoothstep
-                r = int(40 + tt * 150)
-                g = int(tt * 15)
-                b = int(tt * 5)
-            elif t < 0.5:
-                # Red to orange-red
-                tt = (t - 0.25) / 0.25
-                tt = tt * tt * (3 - 2 * tt)
-                r = int(190 + tt * 55)
-                g = int(15 + tt * 50)
-                b = int(5 + tt * 5)
-            elif t < 0.75:
-                # Orange-red to orange
-                tt = (t - 0.5) / 0.25
-                tt = tt * tt * (3 - 2 * tt)
-                r = int(245 + tt * 10)
-                g = int(65 + tt * 70)
-                b = int(10 + tt * 15)
-            else:
-                # Orange to bright yellow-white core
-                tt = (t - 0.75) / 0.25
-                tt = tt * tt * (3 - 2 * tt)
-                r = 255
-                g = int(135 + tt * 105)
-                b = int(25 + tt * 180)
-
-            color = f"#{min(255,r):02x}{min(255,g):02x}{min(255,b):02x}"
-            inset = t * (EYE_R - 1)
-            layer = c.create_oval(
-                CX - EYE_R + inset, CY - EYE_R + inset,
-                CX + EYE_R - inset, CY + EYE_R - inset,
-                fill=color, outline=""
-            )
-            self._eye_layers.append(layer)
-
-        # Bright core - 32 layers
-        for i in range(32, 0, -1):
-            t = i / 32
-            r = 255
-            g = int(220 + (1 - t) * 35)
-            b = int(180 + (1 - t) * 60)
-            radius = 1 + t * 5
-            c.create_oval(
-                CX - radius, CY - radius,
-                CX + radius, CY + radius,
-                fill=f"#{r:02x}{min(255,g):02x}{min(255,b):02x}", outline=""
-            )
-
-        self._eye_core = c.create_oval(
-            CX - 2, CY - 2, CX + 2, CY + 2,
-            fill="#fffaf5", outline=""
-        )
-
-        # Eye specular highlight - 20 layers
-        for i in range(20, 0, -1):
-            t = i / 20
-            alpha = int(160 + 80 * t)
-            g_val = int(alpha * 0.55)
-            b_val = int(alpha * 0.35)
-            spread = i * 0.3
-            self._eye_highlight = c.create_oval(
-                CX - EYE_R + 2 + spread * 0.3, CY - EYE_R + 1 + spread * 0.2,
-                CX - 5 + spread, CY - EYE_R + 8 + spread * 0.3,
-                fill=f"#{min(255,alpha):02x}{g_val:02x}{b_val:02x}", outline=""
-            )
-
-        # ═══ HOTKEY LABELS ═══
-        c.create_text(
-            12, 14,
-            text="F8",
-            fill="#505050",
-            font=("Arial", 9, "bold"),
-            anchor="nw"
-        )
-        c.create_text(
-            SIZE - 12, 14,
-            text="F9",
-            fill="#505050",
-            font=("Arial", 9, "bold"),
-            anchor="ne"
-        )
-
-        # ═══ STATE INDICATOR RING ═══
-        self._state_ring = c.create_oval(
-            CX - OUTER_R - 4, CY - OUTER_R - 4,
-            CX + OUTER_R + 4, CY + OUTER_R + 4,
-            outline="#1a1a1a", width=3
-        )
-
-        # ═══ STATUS TEXT ═══
-        self._status_text = c.create_text(
-            CX, SIZE - 10,
-            text="",
-            fill="#1a1a1a",
-            font=("Arial", 10, "bold"),
-            anchor="center"
-        )
+        # ═══ HAL EYE IMAGE WITH GLOW FRAMES ═══
+        self._state_ring = None
+        self._glow_frames = []
+        self._blue_frames = []
+        self._base_frame = None
+        img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hal_eye.png")
+        if _HAS_PIL and os.path.exists(img_path):
+            pil_img = Image.open(img_path).convert("RGBA")
+            self._base_frame = ImageTk.PhotoImage(pil_img)
+            self._glow_frames = self._generate_glow_frames(pil_img)
+            self._blue_frames = self._generate_blue_frames(pil_img)
+            self._img_item = c.create_image(CX, CY, image=self._base_frame, anchor="center")
+        else:
+            c.create_oval(20, 20, SIZE - 20, SIZE - 20, fill="#300000", outline="#555")
+            c.create_oval(50, 50, SIZE - 50, SIZE - 50, fill="#cc0000", outline="")
+            self._img_item = None
 
         # ═══ CLICK BINDING ═══
         c.tag_bind("all", "<ButtonPress-1>", lambda e: self._press())
@@ -785,105 +627,48 @@ class CM7Widget:
         t = time.time()
         st = self._state
 
-        # Target level
-        if st == "recording":
-            target = max(0.3, self._rec.vu)
-        elif st == "processing":
-            pulse = (math.sin(t * 4) + 1) / 2
-            target = 0.5 + pulse * 0.4
-        elif st == "speaking":
-            pulse = (math.sin(t * 3) + 1) / 2
-            target = 0.4 + pulse * 0.3
-        else:
-            # Subtle breathing
-            target = 0.15 + (math.sin(t * 1.5) + 1) / 2 * 0.1
-
-        # Smooth interpolation
-        self._level += (target - self._level) * 0.15
-        level = self._level
-
-        # ═══ UPDATE GLOW ═══
-        num_rings = len(self._glow_rings)
-        for i, ring in enumerate(self._glow_rings):
-            dist = (num_rings - i) / num_rings
-            # Quadratic falloff for ultra-smooth realistic glow
-            falloff = (1 - dist ** 0.7) ** 2
+        # ═══ UPDATE IMAGE GLOW ═══
+        if self._img_item and self._glow_frames:
             if st == "recording":
-                # Intense red-orange glow with ripple — boosted for visibility
-                pulse = (math.sin(t * 8 + i * 0.08) + 1) / 2
-                ripple = (math.sin(t * 12 - i * 0.15) + 1) / 2 * 0.15
-                intensity = int((180 + 130 * level + 50 * pulse + 25 * ripple) * falloff)
-                r = min(255, intensity)
-                g = min(255, int(intensity * 0.35))
-                b = min(255, int(intensity * 0.06))
+                # Pulse the red glow: sine wave maps to frame 4-15
+                pulse = (math.sin(t * 6) + 1) / 2
+                idx = int(4 + pulse * 11)
+                c.itemconfig(self._img_item, image=self._glow_frames[min(idx, 15)])
             elif st == "processing":
-                # Pulsing orange with wave — boosted
-                pulse = (math.sin(t * 5 + i * 0.06) + 1) / 2
-                intensity = int((120 + 80 * pulse) * falloff)
-                r = min(255, intensity)
-                g = min(255, int(intensity * 0.48))
-                b = min(255, int(intensity * 0.08))
+                # Slower orange pulse: frames 2-10
+                pulse = (math.sin(t * 4) + 1) / 2
+                idx = int(2 + pulse * 8)
+                c.itemconfig(self._img_item, image=self._glow_frames[min(idx, 15)])
             elif st == "speaking":
-                # Blue/cyan glow
-                pulse = (math.sin(t * 4 + i * 0.06) + 1) / 2
-                intensity = int((70 + 50 * pulse) * falloff)
-                r = min(255, int(intensity * 0.15))
-                g = min(255, int(intensity * 0.55))
-                b = min(255, intensity)
+                # Blue pulse
+                pulse = (math.sin(t * 3.5) + 1) / 2
+                idx = int(3 + pulse * 12)
+                c.itemconfig(self._img_item, image=self._blue_frames[min(idx, 15)])
             else:
-                # Subtle warm breathing glow
-                breath = (math.sin(t * 1.5) + 1) / 2
-                intensity = int((30 + 35 * level + 10 * breath) * falloff)
-                r = min(255, intensity)
-                g = min(255, int(intensity * 0.28))
-                b = min(255, int(intensity * 0.05))
-            c.itemconfig(ring, fill=f"#{r:02x}{g:02x}{b:02x}")
+                # Idle: subtle breathing glow
+                breath = (math.sin(t * 1.2) + 1) / 2
+                idx = int(breath * 3)
+                c.itemconfig(self._img_item, image=self._glow_frames[min(idx, 15)])
 
-        # ═══ UPDATE EYE CORE ═══
-        if st == "recording":
-            pulse = (math.sin(t * 10) + 1) / 2
-            core_bright = int(200 + 55 * pulse)
-            c.itemconfig(self._eye_core, fill=f"#ff{core_bright:02x}{core_bright-40:02x}")
-            c.itemconfig(self._eye_highlight, fill="#ffb080")
-        elif st == "processing":
-            pulse = (math.sin(t * 6) + 1) / 2
-            c.itemconfig(self._eye_core, fill=f"#ff{int(180+40*pulse):02x}{int(140+30*pulse):02x}")
-            c.itemconfig(self._eye_highlight, fill="#ff9060")
-        elif st == "speaking":
-            pulse = (math.sin(t * 5) + 1) / 2
-            c.itemconfig(self._eye_core, fill=f"#{int(140+30*pulse):02x}{int(180+40*pulse):02x}ff")
-            c.itemconfig(self._eye_highlight, fill="#6090ff")
-        else:
-            c.itemconfig(self._eye_core, fill="#ffe0c0")
-            c.itemconfig(self._eye_highlight, fill="#ff9060")
-
-        # ═══ UPDATE STATUS TEXT & RING ═══
-        if self._status_text and self._state_ring:
+        # ═══ UPDATE STATE RING ═══
+        if self._state_ring:
             if st == "recording":
-                pulse_alpha = int(200 + 55 * ((math.sin(t * 6) + 1) / 2))
-                c.itemconfig(self._status_text, text="REC",
-                             fill=f"#{min(255, pulse_alpha):02x}2020")
-                ring_bright = int(180 + 75 * ((math.sin(t * 8) + 1) / 2))
+                bright = int(180 + 75 * ((math.sin(t * 8) + 1) / 2))
                 c.itemconfig(self._state_ring,
-                             outline=f"#{min(255, ring_bright):02x}1515", width=3)
+                             outline=f"#{min(255, bright):02x}1515", width=4)
             elif st == "processing":
-                c.itemconfig(self._status_text, text="\u2022\u2022\u2022",
-                             fill="#e08030")
-                ring_bright = int(140 + 60 * ((math.sin(t * 5) + 1) / 2))
+                bright = int(140 + 60 * ((math.sin(t * 5) + 1) / 2))
                 c.itemconfig(self._state_ring,
-                             outline=f"#{min(255, ring_bright):02x}{int(ring_bright*0.5):02x}10", width=3)
+                             outline=f"#{min(255, bright):02x}{int(bright*0.5):02x}10", width=4)
             elif st == "speaking":
-                c.itemconfig(self._status_text, text="TTS",
-                             fill="#4080ff")
-                ring_bright = int(100 + 60 * ((math.sin(t * 4) + 1) / 2))
+                bright = int(100 + 60 * ((math.sin(t * 4) + 1) / 2))
                 c.itemconfig(self._state_ring,
-                             outline=f"#15{int(ring_bright*0.6):02x}{min(255, ring_bright):02x}", width=3)
+                             outline=f"#15{int(bright*0.6):02x}{min(255, bright):02x}", width=4)
             else:
-                c.itemconfig(self._status_text, text="", fill="#1a1a1a")
-                c.itemconfig(self._state_ring, outline="#1a1a1a", width=3)
+                c.itemconfig(self._state_ring, outline="#1a1a1a", width=4)
 
         if self._root:
-            self._root.after(25, self._tick)
+            self._root.after(40, self._tick)
 
     def _press(self):
         if self._state != "ready":
@@ -1022,13 +807,50 @@ class CM7Widget:
         self._listener.daemon = True
         self._listener.start()
 
+    def _apply_resize(self, new_size):
+        new_size = max(100, min(400, new_size))
+        if new_size == self._widget_size:
+            return
+        self._widget_size = new_size
+
+        img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hal_eye.png")
+        if _HAS_PIL and os.path.exists(img_path):
+            pil_img = Image.open(img_path).convert("RGBA")
+            pil_img = pil_img.resize((new_size, new_size), Image.LANCZOS)
+            self._base_frame = ImageTk.PhotoImage(pil_img)
+            self._glow_frames = self._generate_glow_frames(pil_img)
+            self._blue_frames = self._generate_blue_frames(pil_img)
+
+        self._root.geometry(f"{new_size}x{new_size}")
+        self._canvas.config(width=new_size, height=new_size)
+        if self._img_item:
+            self._canvas.coords(self._img_item, new_size // 2, new_size // 2)
+
     def _drag_start(self, e):
-        self._dx = e.x_root - self._root.winfo_x()
-        self._dy = e.y_root - self._root.winfo_y()
+        # Detect if click is near a corner (within 20px)
+        margin = 20
+        sz = self._widget_size
+        near_right = e.x > sz - margin
+        near_bottom = e.y > sz - margin
+        if near_right and near_bottom:
+            self._resize_edge = True
+            self._resize_start_x = e.x_root
+            self._resize_start_y = e.y_root
+            self._resize_start_size = self._widget_size
+        else:
+            self._resize_edge = False
+            self._dx = e.x_root - self._root.winfo_x()
+            self._dy = e.y_root - self._root.winfo_y()
 
     def _drag_move(self, e):
         try:
-            self._root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+            if self._resize_edge:
+                dx = e.x_root - self._resize_start_x
+                dy = e.y_root - self._resize_start_y
+                delta = max(dx, dy)
+                self._apply_resize(self._resize_start_size + delta)
+            else:
+                self._root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
         except:
             pass
 
