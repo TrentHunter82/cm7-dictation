@@ -6,3 +6,4 @@ pyautogui
 requests
 Pillow
 numpy
+pyobjc-framework-Quartz

@@ -31,6 +31,16 @@ try:
 except ImportError:
     _HAS_PYNPUT = False
 
+# On macOS 26+, pynput's keyboard Listener crashes because it calls HIToolbox/TSM
+# functions from a background thread.  Use Quartz CGEventTap instead.
+_HAS_QUARTZ_TAP = False
+if _IS_MAC:
+    try:
+        import Quartz
+        _HAS_QUARTZ_TAP = True
+    except ImportError:
+        pass
+
 try:
     import pyperclip
     import pyautogui
@@ -61,6 +71,22 @@ if _HAS_PYNPUT:
         "space": pynput_kb.Key.space, "tab": pynput_kb.Key.tab,
         "esc": pynput_kb.Key.esc,
     })
+
+# Quartz virtual keycodes for hotkey names
+_QUARTZ_KEYCODE_MAP = {
+    "space": 0x31, "tab": 0x30, "esc": 0x35, "return": 0x24,
+    "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76, "f5": 0x60,
+    "f6": 0x61, "f7": 0x62, "f8": 0x64, "f9": 0x65, "f10": 0x6D,
+    "f11": 0x67, "f12": 0x6F, "f13": 0x69, "f14": 0x6B, "f15": 0x71,
+    "f16": 0x6A, "f17": 0x40, "f18": 0x4F, "f19": 0x50, "f20": 0x5A,
+}
+# Quartz modifier flag masks
+_QUARTZ_MOD_MAP = {
+    "ctrl": Quartz.kCGEventFlagMaskControl if _HAS_QUARTZ_TAP else 0,
+    "shift": Quartz.kCGEventFlagMaskShift if _HAS_QUARTZ_TAP else 0,
+    "alt": Quartz.kCGEventFlagMaskAlternate if _HAS_QUARTZ_TAP else 0,
+    "cmd": Quartz.kCGEventFlagMaskCommand if _HAS_QUARTZ_TAP else 0,
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -701,7 +727,7 @@ class CM7Widget:
     def _paste(self, text):
         try:
             time.sleep(0.15)
-            if _HAS_PYNPUT:
+            if _HAS_PYNPUT and not _HAS_QUARTZ_TAP:
                 ctrl = pynput_kb.Controller()
                 ctrl.type(text)
             else:
@@ -772,6 +798,10 @@ class CM7Widget:
             self._state = "ready"
 
     def _register_hotkey(self):
+        # Prefer Quartz CGEventTap on macOS (pynput crashes on macOS 26+)
+        if _HAS_QUARTZ_TAP:
+            self._register_hotkey_quartz()
+            return
         if not _HAS_PYNPUT:
             return
 
@@ -806,6 +836,66 @@ class CM7Widget:
         self._listener = pynput_kb.Listener(on_press=on_press, on_release=on_release)
         self._listener.daemon = True
         self._listener.start()
+
+    def _register_hotkey_quartz(self):
+        """Use Quartz CGEventTap for hotkey detection (no TSM/HIToolbox calls)."""
+        import Quartz
+        from CoreFoundation import CFRunLoopGetCurrent, CFRunLoopRun, CFRunLoopStop, kCFRunLoopDefaultMode, CFMachPortCreateRunLoopSource, CFRunLoopAddSource
+
+        # Parse main hotkey
+        keys = self.hotkey.lower().split("+")
+        main_keycode = _QUARTZ_KEYCODE_MAP.get(keys[-1])
+        required_mods = 0
+        for m in keys[:-1]:
+            required_mods |= _QUARTZ_MOD_MAP.get(m, 0)
+
+        # Parse TTS hotkey
+        tts_keycode = None
+        tts_mods = 0
+        if self._tts and self._tts_hotkey:
+            tts_parts = self._tts_hotkey.lower().split("+")
+            tts_keycode = _QUARTZ_KEYCODE_MAP.get(tts_parts[-1])
+            for m in tts_parts[:-1]:
+                tts_mods |= _QUARTZ_MOD_MAP.get(m, 0)
+
+        root = self._root
+
+        def callback(_proxy, event_type, event, _refcon):
+            keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+            flags = Quartz.CGEventGetFlags(event)
+            if event_type == Quartz.kCGEventKeyDown:
+                if keycode == main_keycode and (flags & required_mods) == required_mods:
+                    if root:
+                        root.after(0, self._press)
+                if tts_keycode is not None and keycode == tts_keycode and (flags & tts_mods) == tts_mods:
+                    if root:
+                        root.after(0, self._tts_toggle)
+            elif event_type == Quartz.kCGEventKeyUp:
+                if keycode == main_keycode:
+                    if root:
+                        root.after(0, self._release)
+            return event
+
+        mask = (1 << Quartz.kCGEventKeyDown) | (1 << Quartz.kCGEventKeyUp) | (1 << Quartz.kCGEventFlagsChanged)
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionListenOnly,
+            mask, callback, None)
+        if tap is None:
+            print("[CM7] Warning: could not create event tap. Check Accessibility permissions.")
+            return
+
+        source = CFMachPortCreateRunLoopSource(None, tap, 0)
+
+        def _run_tap():
+            loop = CFRunLoopGetCurrent()
+            CFRunLoopAddSource(loop, source, kCFRunLoopDefaultMode)
+            Quartz.CGEventTapEnable(tap, True)
+            CFRunLoopRun()
+
+        t = threading.Thread(target=_run_tap, daemon=True)
+        t.start()
 
     def _apply_resize(self, new_size):
         new_size = max(100, min(400, new_size))
